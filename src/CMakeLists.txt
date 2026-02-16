@@ -9,11 +9,13 @@ link_directories(${LLVM_LIBRARY_DIRS})
 
 add_library(CUDA2VectorPass SHARED CUDAVectorisePass.cpp)
 target_link_libraries(CUDA2VectorPass 
-    MLIRVectorDialect 
-    MLIRSCFDialect 
-    MLIRArithDialect 
-    MLIRMemRefDialect 
-    MLIRGPUDialect 
+    MLIRVectorDialect
+    MLIRSCFDialect
+    MLIRArithDialect
+    MLIRMemRefDialect
+    MLIRGPUDialect
     MLIRFuncDialect
     MLIRPass
+    MLIRTransforms
+    MLIRIR
 )
