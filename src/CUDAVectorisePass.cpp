@@ -14,23 +14,149 @@ using namespace mlir;
 
 namespace {
 
+// struct CUDAToVectorPattern : public OpRewritePattern<scf::ParallelOp> {
+//   using OpRewritePattern<scf::ParallelOp>::OpRewritePattern;
+
+//   LogicalResult matchAndRewrite(scf::ParallelOp op, PatternRewriter &rewriter) const override {
+//     auto loc = op.getLoc();
+    
+//     // Setup Types and Constants
+//     const int64_t vWidth = 8;
+//     Type f32Type = rewriter.getF32Type();
+//     VectorType vType = VectorType::get({vWidth}, f32Type);
+//     VectorType maskType = VectorType::get({vWidth}, rewriter.getI1Type());
+
+//     if (op.getStep().empty()) return failure();
+//     Value ub = op.getUpperBound()[0];
+//     Value iv = op.getInductionVars()[0];
+    
+//     // Adjust Loop Step
+//     rewriter.modifyOpInPlace(op, [&]() {
+//       Value newStep = rewriter.create<arith::ConstantIndexOp>(loc, vWidth);
+//       op.getStepMutable().assign(newStep);
+//     });
+
+//     // Setup Masking logic
+//     rewriter.setInsertionPointToStart(op.getBody());
+//     Value diff = rewriter.create<arith::SubIOp>(loc, ub, iv);
+//     Value mask = rewriter.create<vector::CreateMaskOp>(loc, maskType, diff);
+//     Value zeroPadding = rewriter.create<arith::ConstantOp>(loc, f32Type, rewriter.getF32FloatAttr(0.0f));
+
+//     // Setup Attributes
+//     auto mapAttr = AffineMapAttr::get(rewriter.getMultiDimIdentityMap(1));
+//     auto inBoundsAttr = rewriter.getBoolArrayAttr({false});
+
+//     // Transform Body
+//     for (Operation &innerOp : llvm::make_early_inc_range(*op.getBody())) {
+      
+//       // --- LOAD -> vector.transfer_read ---
+//       if (auto load = dyn_cast<memref::LoadOp>(innerOp)) {
+//         rewriter.setInsertionPoint(load);
+        
+//         SmallVector<Value, 4> operands;
+//         operands.push_back(load.getMemref());
+//         for (Value idx : load.getIndices()) operands.push_back(idx);
+//         operands.push_back(zeroPadding);
+//         operands.push_back(mask);
+
+//         auto vRead = rewriter.create<vector::TransferReadOp>(
+//             loc, 
+//             vType, 
+//             operands, 
+//             ArrayRef<NamedAttribute>{
+//                 rewriter.getNamedAttr("permutation_map", mapAttr),
+//                 rewriter.getNamedAttr("in_bounds", inBoundsAttr)
+//             }
+//         );
+//         rewriter.replaceOp(load, vRead.getResult());
+//       }
+
+//       // --- ARITHMETIC (AddF) ---
+//       else if (auto addf = dyn_cast<arith::AddFOp>(innerOp)) {
+//         rewriter.setInsertionPoint(addf);
+//         Value lhs = addf.getLhs();
+//         Value rhs = addf.getRhs();
+//         if (lhs.getType() != vType && lhs.getType().isF32()) 
+//             lhs = rewriter.create<vector::BroadcastOp>(loc, vType, lhs);
+//         if (rhs.getType() != vType && rhs.getType().isF32()) 
+//             rhs = rewriter.create<vector::BroadcastOp>(loc, vType, rhs);
+        
+//         if (lhs.getType() == vType && rhs.getType() == vType) {
+//             auto vAdd = rewriter.create<arith::AddFOp>(loc, lhs, rhs);
+//             rewriter.replaceOp(addf, vAdd.getResult());
+//         }
+//       }
+
+//       // --- ATOMIC ADD ---
+//       else if (auto atomic = dyn_cast<memref::AtomicRMWOp>(innerOp)) {
+//         Value atomicVal = atomic.getValue();
+//         if (atomicVal.getType() == vType) {
+//             rewriter.setInsertionPoint(atomic);
+//             auto reduction = rewriter.create<vector::ReductionOp>(
+//                 loc, vector::CombiningKind::ADD, atomicVal);
+//             rewriter.create<memref::AtomicRMWOp>(
+//                 loc, arith::AtomicRMWKind::addf, reduction.getResult(), 
+//                 atomic.getMemref(), atomic.getIndices());
+//             rewriter.eraseOp(atomic);
+//         }
+//       }
+
+//       // --- STORE -> vector.transfer_write ---
+//       else if (auto store = dyn_cast<memref::StoreOp>(innerOp)) {
+//         rewriter.setInsertionPoint(store);
+//         Value val = store.getValue(); 
+//         if (val.getType() != vType && val.getType().isF32()) 
+//             val = rewriter.create<vector::BroadcastOp>(loc, vType, val);
+        
+//         if (val.getType() == vType) {
+//             SmallVector<Value, 4> operands;
+//             operands.push_back(val);
+//             operands.push_back(store.getMemref());
+//             for (Value idx : store.getIndices()) operands.push_back(idx);
+//             operands.push_back(mask);
+
+//             rewriter.create<vector::TransferWriteOp>(
+//                 loc, 
+//                 TypeRange{}, /* No result type for Store */
+//                 operands, 
+//                 ArrayRef<NamedAttribute>{
+//                     rewriter.getNamedAttr("permutation_map", mapAttr),
+//                     rewriter.getNamedAttr("in_bounds", inBoundsAttr)
+//                 }
+//             );
+//             rewriter.eraseOp(store);
+//         }
+//       }
+
+//       // --- BARRIER ---
+//       else if (isa<gpu::BarrierOp>(innerOp)) {
+//         rewriter.eraseOp(&innerOp);
+//       }
+//     }
+//     return success();
+//   }
+// };
+
 struct CUDAToVectorPattern : public OpRewritePattern<scf::ParallelOp> {
   using OpRewritePattern<scf::ParallelOp>::OpRewritePattern;
 
   LogicalResult matchAndRewrite(scf::ParallelOp op, PatternRewriter &rewriter) const override {
-    auto loc = op.getLoc();
-    
-    // Setup Types and Constants
-    const int64_t vWidth = 8;
-    Type f32Type = rewriter.getF32Type();
-    VectorType vType = VectorType::get({vWidth}, f32Type);
-    VectorType maskType = VectorType::get({vWidth}, rewriter.getI1Type());
-
+    // Only vectorise the innermost loops (Threads). 
+    // Outer loops (Blocks) will be left for OpenMP.
+    if (!op->getParentOfType<scf::ParallelOp>()) return failure();
+        
     if (op.getStep().empty()) return failure();
     Value ub = op.getUpperBound()[0];
     Value iv = op.getInductionVars()[0];
+
+    // Setup Types and Constants    
+    auto loc = op.getLoc();
+    const int64_t vWidth = 8;
+    Type f32Type = rewriter.getF32Type();
+    VectorType vType = VectorType::get({vWidth}, f32Type);
+    VectorType maskType = VectorType::get({vWidth}, rewriter.getI1Type());    
     
-    // Adjust Loop Step
+    // Update Loop Step to vWidth
     rewriter.modifyOpInPlace(op, [&]() {
       Value newStep = rewriter.create<arith::ConstantIndexOp>(loc, vWidth);
       op.getStepMutable().assign(newStep);
@@ -45,7 +171,7 @@ struct CUDAToVectorPattern : public OpRewritePattern<scf::ParallelOp> {
     // Setup Attributes
     auto mapAttr = AffineMapAttr::get(rewriter.getMultiDimIdentityMap(1));
     auto inBoundsAttr = rewriter.getBoolArrayAttr({false});
-
+    
     // Transform Body
     for (Operation &innerOp : llvm::make_early_inc_range(*op.getBody())) {
       
@@ -68,6 +194,9 @@ struct CUDAToVectorPattern : public OpRewritePattern<scf::ParallelOp> {
                 rewriter.getNamedAttr("in_bounds", inBoundsAttr)
             }
         );
+	//            auto vRead = rewriter.create<vector::TransferReadOp>(
+	//                loc, vType, load.getMemRef(), load.getIndices(), mask, /*padding=*/zero);
+
         rewriter.replaceOp(load, vRead.getResult());
       }
 
@@ -115,6 +244,12 @@ struct CUDAToVectorPattern : public OpRewritePattern<scf::ParallelOp> {
             for (Value idx : store.getIndices()) operands.push_back(idx);
             operands.push_back(mask);
 
+
+	    //            rewriter.create<vector::TransferWriteOp>(
+	    //                loc, store.getValueToStore(), store.getMemRef(), store.getIndices(), mask);
+	    //            rewriter.eraseOp(store);
+
+	    
             rewriter.create<vector::TransferWriteOp>(
                 loc, 
                 TypeRange{}, /* No result type for Store */
@@ -133,11 +268,42 @@ struct CUDAToVectorPattern : public OpRewritePattern<scf::ParallelOp> {
         rewriter.eraseOp(&innerOp);
       }
     }
+        
     return success();
   }
 };
 
-struct CUDAToVectorPass : public PassWrapper<CUDAToVectorPass, OperationPass<ModuleOp>> {
+
+struct CUDAToHierarchicalParallelPass : public PassWrapper<CUDAToHierarchicalParallelPass, OperationPass<ModuleOp>> {
+  MLIR_DEFINE_EXPLICIT_INTERNAL_INLINE_TYPE_ID(CUDAToHierarchicalParallelPass)
+
+  void runOnOperation() override {
+    ModuleOp module = getOperation();
+    MLIRContext *ctx = &getContext();
+
+    // PHASE 1: Move Shared Memory (CUDA) to Stack (Alloca)
+    // We place it at the top of the BLOCK parallel loop (Grid loop body)
+    module.walk([&](gpu::AllocOp alloc) {
+      if (auto intAttr = mlir::dyn_cast_or_null<IntegerAttr>(alloc.getType().getMemorySpace())) {
+        if (intAttr.getInt() == 3) {
+          OpBuilder b(alloc);
+          auto stackMem = b.create<memref::AllocaOp>(alloc.getLoc(), mlir::cast<MemRefType>(alloc.getType()));
+          alloc->getResult(0).replaceAllUsesWith(stackMem->getResult(0));
+          alloc.erase();
+        }
+      }
+    });
+
+    // PHASE 2: Apply Vectorization to Innermost (Thread) loops
+    RewritePatternSet patterns(ctx);
+    patterns.add<CUDAToVectorPattern>(ctx);
+    if (failed(applyPatternsGreedily(module, std::move(patterns))))
+      signalPassFailure();
+  }
+};
+  
+  
+  /*struct CUDAToVectorPass : public PassWrapper<CUDAToVectorPass, OperationPass<ModuleOp>> {
   MLIR_DEFINE_EXPLICIT_INTERNAL_INLINE_TYPE_ID(CUDAToVectorPass)
 
   void runOnOperation() override {
@@ -174,10 +340,15 @@ struct CUDAToVectorPass : public PassWrapper<CUDAToVectorPass, OperationPass<Mod
     if (failed(applyPatternsGreedily(module, std::move(patterns))))
       signalPassFailure();
   }
-};
+  };*/
 
 } // namespace
 
-std::unique_ptr<Pass> createCUDAToVectorPass() {
-  return std::make_unique<CUDAToVectorPass>();
+//std::unique_ptr<Pass> createCUDAToVectorPass() {
+//  return std::make_unique<CUDAToVectorPass>();
+//}
+
+std::unique_ptr<Pass> createCUDAToHierarchicalParallelPass() {
+  return std::make_unique<CUDAToHierarchicalParallelPass>();
 }
+
