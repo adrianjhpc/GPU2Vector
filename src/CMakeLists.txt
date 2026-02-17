@@ -15,6 +15,7 @@ target_link_libraries(CUDA2VectorPass
     MLIRMemRefDialect
     MLIRGPUDialect
     MLIRFuncDialect
+    MLIRMathDialect  
     MLIRPass
     MLIRTransforms
     MLIRIR
