@@ -35,7 +35,7 @@ namespace {
       Type elementType = f32Type; // default
       for (auto &op : *op.getBody()) {
 	if (auto load = dyn_cast<memref::LoadOp>(op)) {
-	  elementType = load.getMemref().getType().cast<MemRefType>().getElementType();
+	  elementType = mlir::cast<MemRefType>(load.getMemref().getType()).getElementType();
         break;
 	}
       }
