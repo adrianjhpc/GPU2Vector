@@ -87,7 +87,21 @@ namespace {
 
       Value mask = rewriter.create<vector::CreateMaskOp>(loc, maskType, diff);
       Value zeroPadding = rewriter.create<arith::ConstantOp>(loc, f32Type, rewriter.getF32FloatAttr(0.0f));
-    
+
+      // Deal with different types of scalar values
+      auto getVecOp = [&](Value scalarVal) -> Value {
+	if (vectorisedMapping.count(scalarVal))
+	  return vectorisedMapping[scalarVal];
+	
+	auto type = scalarVal.getType();
+	// Create a vector version of the scalar type
+	auto vType = VectorType::get({vWidth}, type);
+
+	rewriter.setInsertionPointAfterValue(scalarVal);
+	// If it's a constant or a uniform value, splat/broadcast it
+	return rewriter.create<vector::BroadcastOp>(loc, vType, scalarVal).getResult();
+      };
+      
       // Transform the body
       for (Operation &innerOp : llvm::make_early_inc_range(*op.getBody())) {
       
@@ -112,17 +126,40 @@ namespace {
 	  rewriter.replaceOp(load, vRead.getResult());
 	}
       
-	// --- ARITHMETIC (AddF) ---
-	else if (auto addf = dyn_cast<arith::AddFOp>(innerOp)) {
-	  rewriter.setInsertionPoint(addf);
-	  Value vLhs = getVecOp(addf.getLhs());
-	  Value vRhs = getVecOp(addf.getRhs());
-        
-	  auto vAdd = rewriter.create<arith::AddFOp>(loc, vLhs, vRhs);
-	  vectorisedMapping[addf.getResult()] = vAdd.getResult(); // Record result
-	  rewriter.replaceOp(addf, vAdd.getResult());
-	}
       
+	// --- GENERIC ARITHMETIC HANDLER ---
+	// This handles AddF, SubF, MulF, DivF, AddI, SubI, MulI, AndI, ShlI, etc.
+	else if (innerOp.getDialect()->getNamespace() == "arith") {
+	  // Only handle standard element-wise ops (1 result, 1 or more operands)
+	  if (innerOp.getNumResults() == 1 && innerOp.getNumOperands() >= 1) {
+	    rewriter.setInsertionPoint(&innerOp);
+	    
+	    // Vectorise all operands (LHS, RHS, etc.)
+	    SmallVector<Value, 2> vOperands;
+	    for (Value operand : innerOp.getOperands()) {
+	      vOperands.push_back(getVecOp(operand));
+	    }
+	    
+	    // Determine the new vector result type
+	    Type scalarRetType = innerOp.getResult(0).getType();
+	    VectorType vRetType = VectorType::get({vWidth}, scalarRetType);
+	    
+	    // Create a new version of the op with vector operands and result
+	    // OperationState allows us to create an op by name (e.g., "arith.addf")
+	    OperationState state(loc, innerOp.getName().getStringRef());
+	    state.addOperands(vOperands);
+	    state.addTypes(vRetType);
+	    state.addAttributes(innerOp.getAttrs());
+	    
+	    Operation *vOp = rewriter.create(state);
+	    
+	    // Update mapping and replace
+	    vectorisedMapping[innerOp.getResult(0)] = vOp->getResult(0);
+	    rewriter.replaceOp(&innerOp, vOp->getResults());
+	    continue; // Skip to next iteration
+	  }
+	}
+
 	// --- MATH OPERATIONS ---
 	else if (mlir::isa<math::ExpOp, math::SqrtOp, math::TanhOp, math::SinOp, math::CosOp>(innerOp)) {
 	
@@ -148,7 +185,7 @@ namespace {
 	    rewriter.replaceOp(&innerOp, vMath->getResults());
 	  }
 	}
-      
+	
 	// --- SHUFFLE ---
 	else if (auto shfl = dyn_cast<gpu::ShuffleOp>(innerOp)) {
 	  rewriter.setInsertionPoint(shfl);
@@ -179,7 +216,12 @@ namespace {
 	  }
 	
 	}
-      
+
+	// --- BARRIER ---
+	else if (isa<gpu::BarrierOp>(innerOp)) {
+	  rewriter.eraseOp(&innerOp);
+	}
+	
 	// --- STORE ---
 	else if (auto store = dyn_cast<memref::StoreOp>(innerOp)) {
 	  rewriter.setInsertionPoint(store);
@@ -201,10 +243,6 @@ namespace {
 	  rewriter.eraseOp(atomic);
 	}
       
-	// --- BARRIER ---
-	else if (isa<gpu::BarrierOp>(innerOp)) {
-	  rewriter.eraseOp(&innerOp);
-	}
       
 	else if (auto call = dyn_cast<func::CallOp>(innerOp)) {
 	  auto callee = call.getCallee();
