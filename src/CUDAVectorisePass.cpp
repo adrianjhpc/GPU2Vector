@@ -40,8 +40,14 @@ namespace {
 	}
       }
       unsigned bitWidth = elementType.getIntOrFloatBitWidth();      
+
+      if (targetBitWidth % bitWidth != 0) {
+	return rewriter.notifyMatchFailure(op, "Incompatible register/element width");
+      }
+      
       unsigned vWidth = targetBitWidth / bitWidth;
-    
+
+      
       VectorType vType = VectorType::get({vWidth}, f32Type);
       VectorType maskType = VectorType::get({vWidth}, rewriter.getI1Type());
     
