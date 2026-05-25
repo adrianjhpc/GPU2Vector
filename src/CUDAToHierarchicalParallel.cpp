@@ -31,7 +31,7 @@ using namespace mlir::enzyme;
 
 namespace {
 
-  // --- Bridge Pattern to convert GPU Launch into SCF Parallel Loops ---
+  // Bridge Pattern to convert GPU Launch into SCF Parallel Loops
   struct LaunchToParallelPattern : public OpRewritePattern<gpu::LaunchOp> {
     using OpRewritePattern<gpu::LaunchOp>::OpRewritePattern;
 
@@ -102,7 +102,7 @@ namespace {
     }
   };
 
-  // --- Collapse Grid and Block loops into a 1D loop ---
+  // Collapse Grid and Block loops into a 1D loop
   struct ParallelLoopCollapsePattern : public OpRewritePattern<scf::ParallelOp> {
     using OpRewritePattern<scf::ParallelOp>::OpRewritePattern;
 
@@ -222,7 +222,6 @@ namespace {
     }
   };
 
-  // --- BULLETPROOF: Safe Barrier Handling ---
   struct BarrierFissionPattern : public OpRewritePattern<scf::ParallelOp> {
     using OpRewritePattern<scf::ParallelOp>::OpRewritePattern;
 
@@ -252,7 +251,7 @@ namespace {
         targetUnrollFactor(unrollFactor) {}
 
     LogicalResult matchAndRewrite(scf::ParallelOp op, PatternRewriter &rewriter) const override {
-      //Guard against re-processing
+      // Guard against re-processing
       if (op->hasAttr("vectorized")) return failure();
       if (op.getLowerBound().size() != 1) return failure();
 
@@ -482,7 +481,6 @@ namespace {
 							      SmallVector<Value> idxs;
 							      for (auto i : store.getIndices()) {
 								Value idxVal = mapping.lookupOrDefault(i);
-								// THE FIX: Use the static vector::ExtractOp instead
 								if (llvm::isa<VectorType>(idxVal.getType())) {
 								  idxVal = nestedBuilder.create<vector::ExtractOp>(nestedLoc, idxVal, ArrayRef<int64_t>{0});
 								}
@@ -631,7 +629,7 @@ namespace {
 
       // This allows the LaunchToParallelPattern to generate scf.parallel loops,
       // and then immediately feeds those new loops into vectoriser, tiling, and fission patterns.
-      if (failed(applyPatternsAndFoldGreedily(module, std::move(patterns)))) {
+      if (failed(applyPatternsGreedily(module, std::move(patterns)))) {
 	signalPassFailure();
       }
     }
