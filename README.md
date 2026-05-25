@@ -6,17 +6,21 @@ The code development approach for CUDA or HIP restricts code functionality to so
 ## Structure of the repository
 The source code for the MLIR functionality that will covert CUDA or HIP code into vectorised instructions is in the `src/` directory.
 
+It also includes the _compiler driver_, the code that automates this process.
+
 The `example/` directory has example applications to test the functoinality.
 
 `run.sh` is an example end to end compilation script for a single CUDA file assuming you have already built the MLIR code in the src directory. Instructions on how to build that are below.
 
 ## Prerequisites
-This tool depends on the LLVM compiler infrastructure, in particular the `clang` compiler(s). 
+This tool depends on a fork of [Enzyme-JAX](https://github.com/adrianjhpc/Enzyme-JAX), which in turn depends on the LLVM compiler infrastructure, in particular the `clang` compiler(s). 
 
 We also use the [Polygeist](https://github.com/llvm/Polygeist) LLVM front-end for converting CUDA and HIP code into MLIR intermediate representation.
 
 We use the [CMake](https://cmake.org/) build system to create the MLIR plugin that generates the vector instructions.
 
+
 ## Building
-To build our MLIR plugin create a build directory (for instance `mkdir build`, enter that directory (i.e. `cd build`) and then run cmake (`cmake ../; make`).
+Currently this repository is just a source code home for the plugin that is, in practice, built in Enzyme-JAX. You should download and build the fork mentioned above to actually use the code.
+
 
