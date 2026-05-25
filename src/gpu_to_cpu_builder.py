@@ -4,14 +4,16 @@ import argparse
 import os
 import tempfile
 import re
+import contextlib
 
+# Toolchain Paths
 cgeist = "/mnt/pvc/Polygeist/build/bin/cgeist"
 polygeist_opt = "/mnt/pvc/Polygeist/build/bin/polygeist-opt"
-mlir_opt = "/mnt/pvc/Enzyme-JAX/bazel-bin/enzymexlamlir-opt"
-mlir_translate = "/mnt/pvc/Enzyme-JAX/install/execroot/__main__/bazel-out/k8-opt/bin/external/llvm-project/mlir/mlir-translate.runfiles/__main__/external/llvm-project/mlir/mlir-translate"
-clang = "/mnt/pvc/Enzyme-JAX/install/execroot/__main__/bazel-out/k8-opt/bin/external/llvm-project/clang/clang.runfiles/llvm-project/clang/clang"
+enzyme_opt = "/mnt/pvc/Enzyme-JAX/bazel-bin/enzymexlamlir-opt"
+mlir_translate = "/mnt/pvc/Enzyme-JAX/bazel-bin/external/llvm-project/mlir/mlir-translate"
+clang = "clang"
+host_compiler = "clang++"
 
-# STRICTLY LLVM's OpenMP runtime for __kmpc compatibility
 openmp_flag = "-fopenmp=libomp"
 
 def sanitize_cuda_source(input_path, output_path):
@@ -23,11 +25,11 @@ def sanitize_cuda_source(input_path, output_path):
         content = f.read()
 
     # 1. cudaMalloc((void**)&d_A, size) -> d_A = (decltype(d_A))malloc(size)
-    content = re.sub(r'cudaMalloc\s*\(\s*(?:\(\s*void\s*\*\*\s*\))?\s*&?\s*([a-zA-Z0-9_]+)\s*,\s*(.*?)\s*\)', 
+    content = re.sub(r'cudaMalloc\s*\(\s*(?:\(\s*void\s*\*\*\s*\))?\s*&?\s*([a-zA-Z0-9_]+)\s*,\s*(.*?)\s*\)',
                      r'\1 = (decltype(\1))malloc(\2)', content)
 
     # 2. cudaMemcpy(d_C, d_A, size, cudaMemcpy...) -> memcpy(d_C, d_A, size)
-    content = re.sub(r'cudaMemcpy\s*\(\s*([a-zA-Z0-9_]+)\s*,\s*([a-zA-Z0-9_]+)\s*,\s*(.*?)\s*,\s*[a-zA-Z0-9_]+\s*\)', 
+    content = re.sub(r'cudaMemcpy\s*\(\s*([a-zA-Z0-9_]+)\s*,\s*([a-zA-Z0-9_]+)\s*,\s*(.*?)\s*,\s*[a-zA-Z0-9_]+\s*\)',
                      r'memcpy(\1, \2, \3)', content)
 
     # 3. cudaFree(d_A) -> free(d_A)
@@ -48,205 +50,191 @@ def sanitize_cuda_source(input_path, output_path):
     with open(output_path, 'w') as f:
         f.write(headers + content)
 
-def extract_signature(func_decl):
-    sig = func_decl.split("attributes")[0].strip()
-    if not sig.endswith(")"):
-        sig = sig.rsplit("{", 1)[0].strip()
-    return sig
 
-def split_and_prepare_mlir(input_file, host_file, kernel_file):
-    with open(input_file, 'r') as f:
-        lines = f.readlines()
+def fix_dlti_dialect_only(mlir_path):
+    """
+    Strips the DLTI spec so Enzyme's newer MLIR parser doesn't crash on
+    Polygeist's older data layouts.
+    """
+    with open(mlir_path, 'r') as f:
+        content = f.read()
 
-    host_lines = ["module {\n"]
-    kernel_lines = ["module {\n"]
+    content = re.sub(
+        r'dlti\.dl_spec\s*=\s*#dlti\.dl_spec<.*?>,\s*(?=llvm\.data_layout)',
+        '',
+        content,
+        flags=re.DOTALL
+    )
 
-    start_idx = 0
-    for i, line in enumerate(lines):
-        if line.lstrip().startswith("func.func") or line.lstrip().startswith("llvm.func") or line.lstrip().startswith("llvm.mlir.global") or line.lstrip().startswith("memref.global"):
-            start_idx = i
-            break
+    with open(mlir_path, 'w') as f:
+        f.write(content)
 
-    brace_count = 0
-    current_block = []
-    aliases = []
 
-    for idx, line in enumerate(lines[start_idx:]):
-        if line.strip() == "}" and brace_count == 0:
-            aliases = lines[start_idx + idx + 1:]
-            break
+def fix_mlir_for_enzyme(mlir_path):
+    with open(mlir_path, 'r') as f:
+        content = f.read()
 
-        current_block.append(line)
-        brace_count += line.count("{") - line.count("}")
+    # Strip the DLTI Version Mismatch
+    content = re.sub(
+        r'dlti\.dl_spec\s*=\s*#dlti\.dl_spec<.*?>,\s*(?=llvm\.data_layout)',
+        '',
+        content,
+        flags=re.DOTALL
+    )
 
-        if brace_count == 0 and current_block:
-            block_text = "".join(current_block)
+    # Translate custom Polygeist pointer casts to Standard MLIR
+    
+    # Fix memref -> pointer
+    pattern_m2p = r'%([a-zA-Z0-9_]+)\s*=\s*"polygeist\.memref2pointer"\((%[a-zA-Z0-9_]+)\)\s*:\s*\((memref<[^>]+>)\)\s*->\s*(!llvm\.ptr[^\n]*)'
+    replacement_m2p = (
+        r'%idx_\1 = memref.extract_aligned_pointer_as_index \2 : \3 -> index\n'
+        r'    %i64_\1 = arith.index_cast %idx_\1 : index to i64\n'
+        r'    %\1 = llvm.inttoptr %i64_\1 : i64 to \4'
+    )
+    content = re.sub(pattern_m2p, replacement_m2p, content)
 
-            if "polygeist.device_only_func" in block_text:
-                if "__device_stub__" in block_text:
-                    pass
+    # Fix pointer -> memref (The Double-Cast Fold Strategy)
+    pattern_p2m = r'%([a-zA-Z0-9_]+)\s*=\s*"polygeist\.pointer2memref"\((%[a-zA-Z0-9_]+)\)\s*:\s*\((!llvm\.ptr[^)]*)\)\s*->\s*(memref<[^>]+>)'
+    replacement_p2m = (
+        r'%c0_i64_\1 = llvm.mlir.constant(0 : i64) : i64\n'
+        r'    %c1_i64_\1 = llvm.mlir.constant(1 : i64) : i64\n'
+        r'    %undef_\1 = llvm.mlir.undef : !llvm.struct<(ptr, ptr, i64, array<1 x i64>, array<1 x i64>)>\n'
+        r'    %s1_\1 = llvm.insertvalue \2, %undef_\1[0] : !llvm.struct<(ptr, ptr, i64, array<1 x i64>, array<1 x i64>)>\n'
+        r'    %s2_\1 = llvm.insertvalue \2, %s1_\1[1] : !llvm.struct<(ptr, ptr, i64, array<1 x i64>, array<1 x i64>)>\n'
+        r'    %s3_\1 = llvm.insertvalue %c0_i64_\1, %s2_\1[2] : !llvm.struct<(ptr, ptr, i64, array<1 x i64>, array<1 x i64>)>\n'
+        r'    %s4_\1 = llvm.insertvalue %c0_i64_\1, %s3_\1[3, 0] : !llvm.struct<(ptr, ptr, i64, array<1 x i64>, array<1 x i64>)>\n'
+        r'    %s5_\1 = llvm.insertvalue %c1_i64_\1, %s4_\1[4, 0] : !llvm.struct<(ptr, ptr, i64, array<1 x i64>, array<1 x i64>)>\n'
+        r'    %\1 = builtin.unrealized_conversion_cast %s5_\1 : !llvm.struct<(ptr, ptr, i64, array<1 x i64>, array<1 x i64>)> to \4'
+    )
+    content = re.sub(pattern_p2m, replacement_p2m, content)
+
+    # Context-Aware AST Stack Parser for Terminators
+    lines = content.split('\n')
+    out_lines = []
+    scope_stack = []
+
+    for line in lines:
+        if "scf.yield" in line:
+            if scope_stack and scope_stack[-1] == "scf.parallel":
+                line = line.replace("scf.yield", "scf.reduce")
+
+        if "}" in line:
+            for _ in range(line.count("}")):
+                if scope_stack:
+                    scope_stack.pop()
+
+        if "{" in line:
+            for _ in range(line.count("{")):
+                if "scf.parallel" in line:
+                    scope_stack.append("scf.parallel")
+                elif "scf.if" in line:
+                    scope_stack.append("scf.if")
+                elif "scf.for" in line:
+                    scope_stack.append("scf.for")
                 else:
-                    sig = extract_signature(current_block[0])
-                    if "private " not in sig:
-                        sig = sig.replace("func.func ", "func.func private ").replace("llvm.func ", "llvm.func ")
-                    host_lines.append(f"  {sig}\n")
+                    scope_stack.append("other")
 
-                    kernel_lines.append(current_block[0].replace("private ", ""))
-                    kernel_lines.append(f"    %c1 = arith.constant 1 : index\n")
-                    kernel_lines.append(f"    %bx = arith.constant 16 : index\n")
-                    kernel_lines.append(f"    %gx = arith.constant 64 : index\n")
-                    kernel_lines.append(f"    gpu.launch blocks(%grid_id_x, %grid_id_y, %grid_id_z) in (%grid_x = %gx, %grid_y = %gx, %grid_z = %c1)\n")
-                    kernel_lines.append(f"               threads(%thread_id_x, %thread_id_y, %thread_id_z) in (%block_x = %bx, %block_y = %bx, %block_z = %c1) {{\n")
+        out_lines.append(line)
 
-                    skip_next = False
-                    for b_line in current_block[1:]:
-                        b_line = b_line.replace("nvvm.barrier0", "gpu.barrier")
-
-                        if "scf.if" in b_line:
-                            skip_next = True
-                            continue
-                        if skip_next and b_line.strip() == "}":
-                            skip_next = False
-                            continue
-
-                        if b_line.strip() == "return" or b_line.strip() == "llvm.return":
-                            kernel_lines.append("      gpu.terminator\n    }\n")
-                        kernel_lines.append(b_line)
-            else:
-                skip_braces = 0
-                for h_line in current_block:
-                    if "gpu.launch " in h_line and "{" in h_line:
-                        skip_braces += 1
-                        continue
-                    if "gpu.terminator" in h_line:
-                        continue
-                    if skip_braces > 0 and h_line.strip() == "}":
-                        skip_braces -= 1
-                        continue
-
-                    if "__device_stub__" in h_line:
-                        h_line = h_line.replace("__device_stub__", "")
-
-                    if " call @" in h_line:
-                        h_line = h_line.replace(" call @", " func.call @")
-                    elif h_line.lstrip().startswith("call @"):
-                        h_line = h_line.replace("call @", "func.call @", 1)
-                        
-                    if h_line.lstrip().startswith("return ") or h_line.strip() == "return":
-                        h_line = h_line.replace("return", "func.return", 1)
-
-                    host_lines.append(h_line)
-
-            current_block = []
-
-    host_lines.append("}\n")
-    kernel_lines.append("}\n")
-
-    host_lines.extend(aliases)
-    kernel_lines.extend(aliases)
-
-    with open(host_file, 'w') as f: f.writelines(host_lines)
-    with open(kernel_file, 'w') as f: f.writelines(kernel_lines)
-    print(f"[+] Split complete: Host and Kernel MLIR generated in temp directory.")
+    with open(mlir_path, 'w') as f:
+        f.write('\n'.join(out_lines))
 
 def run_cmd(cmd):
     print(f"[+] Running: {' '.join(cmd)}")
     result = subprocess.run(cmd, capture_output=True, text=True)
+   
+
+    print(f"[*] Compiler Output (stderr):\n{result.stderr}")
+    if result.stderr and result.stderr.strip():
+        print(f"[*] Compiler Output (stderr):\n{result.stderr}")
+        
     if result.returncode != 0:
-        print(f"[-] Error executing command:\n{result.stderr}")
+        print(f"[-] Error executing command!\n")
         sys.exit(1)
 
-def compile_pipeline(args):
-    final_output_path = os.path.abspath(args.output)
+def compile_cuda_to_object(input_path, obj_path, tmpdir):
+    """Pushes a .cu file through the Polygeist/Enzyme pipeline to get a .o file."""
+    print(f"[+] Compiling CUDA to Object: {input_path}")
+    
+    base_name = os.path.splitext(os.path.basename(input_path))[0]
+    raw_mlir = os.path.join(tmpdir, f"{base_name}_1_raw.mlir")
+    final_mlir = os.path.join(tmpdir, f"{base_name}_2_final.mlir")
+    final_ll = os.path.join(tmpdir, f"{base_name}_final.ll")
+    sanitized_cu = os.path.join(tmpdir, f"{base_name}_sanitized.cu")
 
-    with tempfile.TemporaryDirectory(dir="/tmp", prefix="enzyme_build_") as tmpdir:
-        print(f"[*] Created unique temporary workspace: {tmpdir}")
+    sanitize_cuda_source(input_path, sanitized_cu)
+    
+    # Phase 1: Frontend
+    run_cmd([cgeist, sanitized_cu, "-O3", "-fopenmp", "-I.", "-I/usr/local/cuda/include",
+             "--cuda-gpu-arch=sm_80", "--cuda-lower", "--cpuify=distribute.mincut", "-S", "-o", raw_mlir])
 
-        input_mlir = args.input
+    # Phase 1.5: Patching
+    fix_mlir_for_enzyme(raw_mlir)
 
-        if args.input.endswith(".cu") or args.input.endswith(".cu.cc"):
-            print("[+] Detected CUDA file! Sanitizing source via Regex...")
-            sanitized_cu = os.path.join(tmpdir, "sanitized_input.cu")
-            sanitize_cuda_source(args.input, sanitized_cu)
-            
-            input_mlir = os.path.join(tmpdir, "raw_polygeist.mlir")
-            run_cmd([cgeist, sanitized_cu, "-O3", "-I.", "-I/usr/local/cuda/include", "--cuda-gpu-arch=sm_80", "-S", "-o", input_mlir])
+    # Phase 2: Enzyme Backend
+    run_cmd([
+        enzyme_opt, raw_mlir, "-allow-unregistered-dialect",
+        "--inline", "--lower-affine", "--convert-scf-to-openmp",   
+        "--finalize-memref-to-llvm", "--convert-scf-to-cf",       
+        "--convert-openmp-to-llvm", "--convert-arith-to-llvm",   
+        "--convert-func-to-llvm", "--reconcile-unrealized-casts",
+        "--canonicalize", "-o", final_mlir
+    ])
 
-        host_mlir = os.path.join(tmpdir, "host.mlir")
-        kernel_mlir = os.path.join(tmpdir, "kernel.mlir")
-        kernel_llvm_mlir = os.path.join(tmpdir, "kernel_llvm.mlir")
-        host_llvm_mlir = os.path.join(tmpdir, "host_llvm.mlir")
-        kernel_ll = os.path.join(tmpdir, "kernel.ll")
-        host_ll = os.path.join(tmpdir, "host.ll")
-        host_o = os.path.join(tmpdir, "host.o")
-        kernel_o = os.path.join(tmpdir, "kernel.o")
+    # Phase 3: Translate to LLVM IR
+    run_cmd([mlir_translate, "--mlir-to-llvmir", final_mlir, "-o", final_ll])
+    
+    # Phase 4: Compile to Object File (-c flag means "Compile only, do not link")
+    run_cmd([clang, "-c", "-O3", openmp_flag, final_ll, "-o", obj_path])
 
-        split_and_prepare_mlir(input_mlir, host_mlir, kernel_mlir)
+def compile_cpp_to_object(input_path, obj_path, tmpdir):
+    """Bypasses MLIR and compiles standard C++ host code directly to a .o file."""
+    print(f"[+] Compiling standard C++ to Object: {input_path}")
 
-        pass_opts = f"reg-bit-width={args.vector_width} unroll-factor={args.unroll_factor} max-threads={args.threads}"
+    base_name = os.path.splitext(os.path.basename(input_path))[0]
+    sanitized_cpp = os.path.join(tmpdir, f"{base_name}_sanitized.cpp")
+    
+    # 1. Sanitize the host code to remove CUDA memory/event calls
+    sanitize_cuda_source(input_path, sanitized_cpp)
 
-        print("[+] Compiling Kernel MLIR...")
-        kernel_opt_cmd = [
-            mlir_opt, kernel_mlir,
-            "--lower-affine",
-            f"--cuda-to-hierarchical-parallel={pass_opts}",
-            "--convert-scf-to-openmp", "--convert-scf-to-cf", "--convert-openmp-to-llvm",
-            "--convert-vector-to-llvm", "--convert-index-to-llvm", "--convert-arith-to-llvm",
-            "--finalize-memref-to-llvm", "--convert-func-to-llvm", "--reconcile-unrealized-casts"
-        ]
-        with open(kernel_llvm_mlir, "w") as f:
-            subprocess.run(kernel_opt_cmd, stdout=f, check=True)
+# Using standard clang++ for normal host code
+    run_cmd([host_compiler, "-c", "-O3", openmp_flag, "-I.", "-I/usr/local/cuda/include", sanitized_cpp, "-o", obj_path])
 
-        print("[+] Lowering Polygeist dialects in Host MLIR...")
-        host_intermediate_mlir = os.path.join(tmpdir, "host_intermediate.mlir")
-        host_polygeist_cmd = [
-            polygeist_opt, host_mlir,
-            "--convert-polygeist-to-llvm"
-        ]
-        with open(host_intermediate_mlir, "w") as f:
-            subprocess.run(host_polygeist_cmd, stdout=f, check=True)
+def build_project(args):
+    final_executable = os.path.abspath(args.output)
+    
+    with contextlib.nullcontext("debug_build") as tmpdir:
+        os.makedirs(tmpdir, exist_ok=True)
+        object_files = []
 
-        print("[+] Compiling Host MLIR to LLVM dialects...")
-        host_opt_cmd = [
-            mlir_opt, host_intermediate_mlir,
-            "--canonicalize", "--cse", 
-            "--lower-affine", "--convert-scf-to-cf", "--convert-index-to-llvm",
-            "--convert-arith-to-llvm", "--finalize-memref-to-llvm",
-            "--convert-func-to-llvm", "--reconcile-unrealized-casts",
-            "--canonicalize", "--cse"
-        ]
-        with open(host_llvm_mlir, "w") as f:
-            subprocess.run(host_opt_cmd, stdout=f, check=True)
+        # 1. Compile Phase
+        for src_file in args.inputs:
+            ext = os.path.splitext(src_file)[1].lower()
+            obj_name = os.path.splitext(os.path.basename(src_file))[0] + ".o"
+            obj_path = os.path.join(tmpdir, obj_name)
 
-        print("[+] Translating to LLVM Bitcode...")
-        run_cmd([mlir_translate, "--mlir-to-llvmir", kernel_llvm_mlir, "-o", kernel_ll])
-        run_cmd([mlir_translate, "--mlir-to-llvmir", host_llvm_mlir, "-o", host_ll])
+            if ext == ".cu":
+                compile_cuda_to_object(src_file, obj_path, tmpdir)
+            elif ext in [".cpp", ".c", ".cc"]:
+                compile_cpp_to_object(src_file, obj_path, tmpdir)
+            else:
+                print(f"[-] Skipping unknown file type: {src_file}")
+                continue
+                
+            object_files.append(obj_path)
 
-        print(f"[+] Compiling Host/Kernel Object Files...")
-        run_cmd([clang, "-g", "-c", "-O3", openmp_flag, host_ll, "-o", host_o])
-        run_cmd([clang, "-g", "-c", "-O3", openmp_flag, kernel_ll, "-o", kernel_o])
+        # 2. Link Phase
+        print("\n[+] Phase 5: Linking Object Files...")
+        link_cmd = [host_compiler, "-O3", openmp_flag] + object_files + ["-o", final_executable, "-L/usr/lib/llvm-20/lib/", "-lm"]
+        run_cmd(link_cmd)
 
-        print(f"[+] Linking final executable -> {final_output_path}")
-        run_cmd([
-            clang,
-            "-g",
-            "-O3", 
-            openmp_flag, 
-            host_o, 
-            kernel_o, 
-            "-o", final_output_path, 
-            "-L/usr/lib/llvm-20/lib/", "-lm"
-        ])
-
-    print(f"[*] Build Successful! You can now run ./{os.path.basename(final_output_path)}")
+    print(f"\n[*] Build Successful! Run ./{os.path.basename(final_executable)}")
 
 if __name__ == "__main__":
-    parser = argparse.ArgumentParser(description="Compile Polygeist CUDA output to CPU Vectors")
-    parser.add_argument("input", help="Raw MLIR file or CUDA (.cu) file from Polygeist")
-    parser.add_argument("-o", "--output", default="matrix_math", help="Final executable output name")
-    parser.add_argument("-t", "--threads", default="256", help="Maximum OpenMP threads")
-    parser.add_argument("-v", "--vector-width", default="256", help="Vector register bit-width (e.g., 256 for AVX2)")
-    parser.add_argument("-u", "--unroll-factor", default="4", help="Loop unroll factor")
-
+    parser = argparse.ArgumentParser(description="Multi-file GPU-to-CPU Builder")
+    # 'nargs='+' allows you to pass multiple files to the script
+    parser.add_argument("inputs", nargs='+', help="Input source files (.cu, .cpp)")
+    parser.add_argument("-o", "--output", default="a.out", help="Final executable name")
     args = parser.parse_args()
-    compile_pipeline(args)
+    
+    build_project(args)
